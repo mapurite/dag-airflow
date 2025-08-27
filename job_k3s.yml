@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-processing-job
+  namespace: data-jobs
+spec:
+  template:
+    spec:
+      containers:
+      - name: processor
+        image: python:3.9-slim
+        command: ["python", "-c"]
+        args:
+        - |
+          import pandas as pd
+          print("Procesando datos...")
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+      restartPolicy: Never
+  backoffLimit: 3
