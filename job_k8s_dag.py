@@ -1,9 +1,6 @@
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-from airflow.operators.python import PythonOperator
-import yaml
-import os
 
 default_args = {
     'owner': 'data-team',
@@ -11,129 +8,132 @@ default_args = {
     'start_date': datetime(2025, 8, 26),
     'email_on_failure': False,
     'email_on_retry': False,
-    'retries': 3,
-    'retry_delay': timedelta(minutes=5),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=2),
 }
 
 dag = DAG(
-    'execute_external_yaml_job',
+    'debug_k8s_permissions',
     default_args=default_args,
-    description='Ejecuta Job desde archivo YAML externo',
+    description='Debug de permisos de Kubernetes',
     schedule_interval=None,
     catchup=False,
-    tags=['kubernetes', 'yaml', 'external-file']
+    tags=['debug', 'kubernetes']
 )
 
-# Task que ejecuta kubectl apply desde un archivo
-apply_yaml_job = KubernetesPodOperator(
-    task_id='apply_yaml_job',
-    name='kubectl-apply-job',
-    namespace='data-jobs',
+# Task 1: Verificar conexión básica a Kubernetes
+test_connection = KubernetesPodOperator(
+    task_id='test_k8s_connection',
+    name='test-connection',
+    namespace='data-ai-desa',  # Usar el mismo namespace de Airflow
     image='bitnami/kubectl:latest',
     cmds=["/bin/bash", "-c"],
     arguments=["""
-# Ruta donde está tu archivo YAML (monta un volumen o ConfigMap)
-YAML_FILE="/config/data-processing-job.yaml"
+echo "=== DEBUGGING KUBERNETES CONNECTION ==="
+echo "1. Verificando conexión a Kubernetes..."
+kubectl version --client
 
-# Si el archivo viene de un ConfigMap o Secret
-if [ ! -f "$YAML_FILE" ]; then
-    echo "Archivo YAML no encontrado en $YAML_FILE"
-    echo "Creando archivo temporal con la definición..."
-    
-    cat > /tmp/job.yaml << 'EOF'
+echo "2. Verificando ServiceAccount actual..."
+cat /var/run/secrets/kubernetes.io/serviceaccount/namespace
+whoami
+
+echo "3. Verificando permisos actuales..."
+kubectl auth can-i '*' '*' --all-namespaces || true
+kubectl auth can-i create pods --namespace=data-ai-desa || true
+kubectl auth can-i create jobs --namespace=data-jobs || true
+
+echo "4. Listando namespaces disponibles..."
+kubectl get namespaces || true
+
+echo "5. Verificando si namespace data-jobs existe..."
+kubectl get namespace data-jobs || echo "Namespace data-jobs NO existe"
+
+echo "6. Intentando crear un pod simple..."
+kubectl run test-pod --image=busybox --restart=Never --dry-run=client -o yaml || true
+
+echo "=== FIN DEL DEBUG ==="
+    """],
+    get_logs=True,
+    dag=dag,
+    is_delete_operator_pod=True,
+)
+
+# Task 2: Crear namespace si no existe
+create_namespace = KubernetesPodOperator(
+    task_id='create_namespace_if_needed',
+    name='create-namespace',
+    namespace='data-ai-desa',
+    image='bitnami/kubectl:latest',
+    cmds=["/bin/bash", "-c"],
+    arguments=["""
+echo "Verificando si namespace data-jobs existe..."
+if kubectl get namespace data-jobs; then
+    echo "Namespace data-jobs ya existe"
+else
+    echo "Creando namespace data-jobs..."
+    kubectl create namespace data-jobs || echo "No se pudo crear el namespace"
+fi
+
+echo "Verificando estado final..."
+kubectl get namespace data-jobs || echo "Namespace aún no existe"
+    """],
+    get_logs=True,
+    dag=dag,
+    is_delete_operator_pod=True,
+)
+
+# Task 3: Test simple de creación de Job
+test_simple_job = KubernetesPodOperator(
+    task_id='test_simple_job_creation',
+    name='test-simple-job',
+    namespace='data-ai-desa',
+    image='bitnami/kubectl:latest',
+    cmds=["/bin/bash", "-c"],
+    arguments=["""
+echo "=== TESTING JOB CREATION ==="
+
+# Crear un Job muy simple
+cat > /tmp/simple-job.yaml << 'EOF'
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: data-processing-job-{{ run_id | replace(':', '') | replace('.', '') }}
+  name: simple-test-job
   namespace: data-jobs
 spec:
   template:
     spec:
       containers:
-      - name: processor
-        image: python:3.9-slim
-        command: ["python", "-c"]
-        args:
-        - |
-          import pandas as pd
-          print("Procesando datos desde YAML externo...")
-          print("Parámetros: {{ dag_run.conf }}")
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "250m"
-          limits:
-            memory: "1Gi"
-            cpu: "500m"
+      - name: test
+        image: busybox:latest
+        command: ["echo", "Hello from Kubernetes Job!"]
       restartPolicy: Never
-  backoffLimit: 3
+  backoffLimit: 1
 EOF
-    YAML_FILE="/tmp/job.yaml"
-fi
 
-echo "Aplicando Job desde: $YAML_FILE"
-kubectl apply -f $YAML_FILE
+echo "Contenido del Job:"
+cat /tmp/simple-job.yaml
 
-# Obtener nombre del Job
-JOB_NAME=$(grep -E "^\s*name:" $YAML_FILE | head -1 | awk '{print $2}')
-echo "Job creado: $JOB_NAME"
+echo "Intentando aplicar el Job..."
+kubectl apply -f /tmp/simple-job.yaml
 
-# Esperar completitud
-echo "Esperando que el Job complete..."
-kubectl wait --for=condition=complete --timeout=900s job/$JOB_NAME -n data-jobs
+echo "Verificando creación del Job..."
+kubectl get jobs -n data-jobs
 
-# Mostrar logs
-echo "=== LOGS DEL JOB ==="
-kubectl logs -l job-name=$JOB_NAME -n data-jobs --tail=100
+echo "Esperando completitud del Job..."
+sleep 30
 
-# Verificar estado final
-JOB_STATUS=$(kubectl get job $JOB_NAME -n data-jobs -o jsonpath='{.status.conditions[0].type}')
-echo "Estado final del Job: $JOB_STATUS"
+echo "Obteniendo logs del Job..."
+kubectl logs -l job-name=simple-test-job -n data-jobs || true
 
-if [ "$JOB_STATUS" = "Complete" ]; then
-    echo "✅ Job completado exitosamente"
-    exit 0
-else
-    echo "❌ Job falló o no se completó"
-    kubectl describe job $JOB_NAME -n data-jobs
-    exit 1
-fi
-    """],
-    volumes=[],  # Aquí montarías tu ConfigMap o volumen con el YAML
-    volume_mounts=[],
-    get_logs=True,
-    dag=dag,
-    is_delete_operator_pod=True,
-)
+echo "Limpiando Job de prueba..."
+kubectl delete -f /tmp/simple-job.yaml || true
 
-# Task para limpiar Jobs antiguos (opcional)
-cleanup_old_jobs = KubernetesPodOperator(
-    task_id='cleanup_old_jobs',
-    name='cleanup-jobs',
-    namespace='data-jobs',
-    image='bitnami/kubectl:latest',
-    cmds=["/bin/bash", "-c"],
-    arguments=["""
-echo "Limpiando Jobs antiguos..."
-
-# Eliminar Jobs completados con más de 1 hora
-kubectl get jobs -n data-jobs --field-selector status.successful=1 \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.creationTimestamp}{"\n"}{end}' | \
-  while read job_name created_time; do
-    if [ ! -z "$job_name" ]; then
-      # Lógica para eliminar Jobs antiguos
-      echo "Revisando Job: $job_name creado en: $created_time"
-      # kubectl delete job $job_name -n data-jobs
-    fi
-  done
-
-echo "Limpieza completada"
+echo "=== FIN DEL TEST ==="
     """],
     get_logs=True,
     dag=dag,
     is_delete_operator_pod=True,
-    trigger_rule='all_done'  # Ejecuta sin importar si la tarea anterior falló
 )
 
 # Configurar dependencias
-apply_yaml_job >> cleanup_old_jobs
+test_connection >> create_namespace >> test_simple_job
